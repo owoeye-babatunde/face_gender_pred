@@ -1,5 +1,5 @@
-# main.py
-from fastapi import FastAPI, File, UploadFile
+import logging
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import torch
 import torch.nn as nn
@@ -7,10 +7,12 @@ from torchvision import transforms, models
 from torchvision.transforms import InterpolationMode
 from PIL import Image
 import io
-import asyncio
-import numpy as np
-from pydantic import BaseModel
-from typing import Dict, List
+from typing import Dict
+from s3_utils import S3Handler
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -28,44 +30,10 @@ GENDER_CLASSES = ['Female', 'Male']
 RACE_CLASSES = ['Asian', 'Black', 'Indian', 'Latino_Hispanic', 'Middle Eastern', 'White']
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Initialize models
-def load_gender_model():
-    """Initialize and load the gender classification model (ResNet18)"""
-    model = models.resnet18(weights=None)  # Initialize without pretrained weights
-    # Modify the final layer for binary classification
-    model.fc = nn.Linear(model.fc.in_features, 2)
-    # Load the saved state dict
-    checkpoint = torch.load('model_checkpoint.pth', map_location=DEVICE, weights_only=True)
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    elif 'state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['state_dict'])
-    else:
-        model.load_state_dict(checkpoint)
-    return model
-
-def load_race_model():
-    """Initialize and load the race classification model (ResNet50)"""
-    model = models.resnet50(weights=None)  # Initialize without pretrained weights
-    # Modify the final layer for 6-class classification
-    model.fc = nn.Linear(model.fc.in_features, 6)
-    # Load the saved state dict
-    checkpoint = torch.load('best_model.pth', map_location=DEVICE, weights_only=True)
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    elif 'state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['state_dict'])
-    else:
-        model.load_state_dict(checkpoint)
-    return model
-
-# Load and prepare models
-gender_model = load_gender_model()
-race_model = load_race_model()
-gender_model.to(DEVICE)
-race_model.to(DEVICE)
-gender_model.eval()
-race_model.eval()
+# Model configurations
+gender_model = None
+race_model = None
+s3_handler = S3Handler()
 
 # Image transforms
 gender_transform = transforms.Compose([
@@ -87,14 +55,83 @@ race_transform = transforms.Compose([
     )
 ])
 
-class PredictionResponse(BaseModel):
-    gender_probabilities: Dict[str, float]
-    race_probabilities: Dict[str, float]
+async def load_gender_model():
+    """Load gender model from S3 if not already loaded"""
+    global gender_model
+    if gender_model is None:
+        try:
+            logger.info("Loading gender model from S3...")
+            model = models.resnet18(weights=None)
+            model.fc = nn.Linear(model.fc.in_features, 2)
+            
+            # Download model as bytes
+            model_bytes = s3_handler.download_model('model_checkpoint.pth')
+            logger.info("Downloaded gender model from S3")
+            
+            # Load the model from bytes
+            checkpoint = torch.load(model_bytes, map_location=DEVICE)
+            logger.info("Loaded checkpoint into memory")
+
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                logger.info("Loaded gender model using model_state_dict")
+            elif 'state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['state_dict'])
+                logger.info("Loaded gender model using state_dict")
+            else:
+                model.load_state_dict(checkpoint)
+                logger.info("Loaded gender model using direct state dict")
+            
+            model.eval()
+            gender_model = model.to(DEVICE)
+            logger.info(f"Gender model successfully loaded and moved to {DEVICE}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error loading gender model: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to load gender model: {str(e)}")
+    return False
+
+async def load_race_model():
+    """Load race model from S3 if not already loaded"""
+    global race_model
+    if race_model is None:
+        try:
+            logger.info("Loading race model from S3...")
+            model = models.resnet50(weights=None)
+            model.fc = nn.Linear(model.fc.in_features, 6)
+            
+            # Download model as bytes
+            model_bytes = s3_handler.download_model('best_model.pth')
+            logger.info("Downloaded race model from S3")
+            
+            # Load the model from bytes
+            checkpoint = torch.load(model_bytes, map_location=DEVICE)
+            logger.info("Loaded checkpoint into memory")
+
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                logger.info("Loaded race model using model_state_dict")
+            elif 'state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['state_dict'])
+                logger.info("Loaded race model using state_dict")
+            else:
+                model.load_state_dict(checkpoint)
+                logger.info("Loaded race model using direct state dict")
+            
+            model.eval()
+            race_model = model.to(DEVICE)
+            logger.info(f"Race model successfully loaded and moved to {DEVICE}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error loading race model: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to load race model: {str(e)}")
+    return False
 
 async def predict_gender(image: Image.Image) -> Dict[str, float]:
-    """
-    Predict gender probabilities from image
-    """
+    """Predict gender probabilities from image"""
+    await load_gender_model()
     img_tensor = gender_transform(image).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
         output = gender_model(img_tensor)
@@ -102,40 +139,39 @@ async def predict_gender(image: Image.Image) -> Dict[str, float]:
     return {GENDER_CLASSES[i]: float(prob) for i, prob in enumerate(probabilities)}
 
 async def predict_race(image: Image.Image) -> Dict[str, float]:
-    """
-    Predict race probabilities from image
-    """
+    """Predict race probabilities from image"""
+    await load_race_model()
     img_tensor = race_transform(image).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
         output = race_model(img_tensor)
         probabilities = torch.nn.functional.softmax(output[0], dim=0)
     return {RACE_CLASSES[i]: float(prob) for i, prob in enumerate(probabilities)}
 
-@app.post("/predict/", response_model=PredictionResponse)
+@app.post("/predict/")
 async def predict(file: UploadFile = File(...)):
-    """
-    Endpoint to predict both gender and race from a single image
-    """
-    # Read and convert image
-    contents = await file.read()
-    image = Image.open(io.BytesIO(contents)).convert('RGB')
-    
-    # Run predictions in parallel
-    gender_task = asyncio.create_task(predict_gender(image))
-    race_task = asyncio.create_task(predict_race(image))
-    
-    # Wait for both predictions
-    gender_probs, race_probs = await asyncio.gather(gender_task, race_task)
-    
-    return PredictionResponse(
-        gender_probabilities=gender_probs,
-        race_probabilities=race_probs
-    )
+    """Endpoint to predict both gender and race from a single image"""
+    try:
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents)).convert('RGB')
+        
+        gender_probs = await predict_gender(image)
+        race_probs = await predict_race(image)
+        
+        return {
+            "gender_probabilities": gender_probs,
+            "race_probabilities": race_probs
+        }
+    except Exception as e:
+        logger.error(f"Error occurred: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-    print("\nAccess the API at:")
-    print("    http://localhost:8000")
-    print("    or")
-    print("    http://127.0.0.1:8000")
+@app.on_event("startup")
+async def startup_event():
+    """Load models on startup"""
+    await load_gender_model()
+    await load_race_model()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up temporary files on shutdown"""
+    s3_handler.cleanup()

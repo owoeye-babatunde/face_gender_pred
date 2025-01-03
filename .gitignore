@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+*.pth.env
+
+# Ignore .env file
+.env
