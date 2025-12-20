@@ -1,4 +1,4 @@
-# Python-generated files
+.idea/
 __pycache__/
 *.py[oc]
 build/
